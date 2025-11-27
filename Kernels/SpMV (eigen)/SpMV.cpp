@@ -1,195 +1,300 @@
-#include <omp.h>
-#include <vector>
-#include <atomic>
-#include <random>
-#include <iostream>
-#include <algorithm>
 
-const int N = 500000000;  // 10M nodos
-const int AVG_DEGREE = 50;
+#include <iostream>
+#include <vector>
+#include <chrono>
+#include <cmath>
+#include <algorithm>
+#include <random>
+#include <omp.h>
+#include <cstring>
+#include <iomanip>
+
+constexpr int ROWS = 1000000;
+constexpr int COLS = 1000000;
+constexpr int AVG_NNZ_PER_ROW = 32;
+constexpr int NUM_TRIALS = 10;
+constexpr int NUM_THREADS = 16;
+
+
+double get_time() {
+    return std::chrono::duration<double>(
+        std::chrono::high_resolution_clock::now().time_since_epoch()
+    ).count();
+}
+
+struct SparseMatrix {
+    std::vector<int> row_ptr;
+    std::vector<int> col_idx;
+    std::vector<double> val;
+    int rows, cols;
+    long long nnz;
+};
+
+SparseMatrix generate_random_matrix(int rows, int cols, int avg_nnz) {
+    SparseMatrix A;
+    A.rows = rows;
+    A.cols = cols;
+    
+    std::mt19937 gen(42);
+    std::poisson_distribution<> poisson(avg_nnz);
+    
+    std::cout << "[*] Calculating row structure...\n";
+    A.row_ptr.resize(rows + 1, 0);
+    for (int i = 0; i < rows; i++) {
+        int nnz_in_row = std::max(1, poisson(gen));
+        A.row_ptr[i + 1] = A.row_ptr[i] + nnz_in_row;
+    }
+    A.nnz = A.row_ptr[rows];
+    
+    std::cout << "[*] Total NNZ: " << A.nnz << " (density: " 
+              << (100.0 * A.nnz / (long long)rows / cols) << "%)\n";
+    
+    std::cout << "[*] Generating matrix data...\n";
+    A.col_idx.resize(A.nnz);
+    A.val.resize(A.nnz);
+    
+    #pragma omp parallel for schedule(static) num_threads(NUM_THREADS)
+    for (int i = 0; i < rows; i++) {
+        std::mt19937 local_gen(42 + omp_get_thread_num() * 1000 + i);
+        std::uniform_int_distribution<> local_col_dist(0, cols - 1);
+        std::uniform_real_distribution<> local_val_dist(0.0, 1.0);
+        
+        int start = A.row_ptr[i];
+        int end = A.row_ptr[i + 1];
+        
+        for (int k = start; k < end; k++) {
+            A.col_idx[k] = local_col_dist(local_gen);
+            A.val[k] = local_val_dist(local_gen);
+        }
+    }
+    
+    return A;
+}
+
+void init_vector_numa_aware(std::vector<double>& v, int num_threads) {
+    std::cout << "[*] Initializing vector with random values (NUMA-aware first-touch)...\n";
+    
+    const int n = v.size();
+    
+    #pragma omp parallel for schedule(static) num_threads(num_threads)
+    for (int i = 0; i < n; i++) {
+        std::mt19937 local_gen(42 + omp_get_thread_num());
+        std::uniform_real_distribution<> local_val_dist(0.0, 1.0);
+        
+
+        if (i % (n / num_threads + 1) == 0) {
+             local_gen.seed(42 + omp_get_thread_num() * 1000 + i);
+        }
+        v[i] = local_val_dist(local_gen);
+    }
+}
+
+
+struct BenchmarkResult {
+    double time_sec;
+    double gflops;
+    double bandwidth_gb_s;
+    const char* strategy;
+};
+
+void spmv_static(const SparseMatrix& A, const std::vector<double>& x,
+                 std::vector<double>& y) {
+    #pragma omp parallel for schedule(static) num_threads(NUM_THREADS)
+    for (int i = 0; i < A.rows; i++) {
+        double sum = 0.0;
+        for (int k = A.row_ptr[i]; k < A.row_ptr[i + 1]; k++) {
+            sum += A.val[k] * x[A.col_idx[k]];
+        }
+        y[i] = sum;
+    }
+}
+
+void spmv_dynamic(const SparseMatrix& A, const std::vector<double>& x,
+                  std::vector<double>& y, int chunk_size = 256) {
+    #pragma omp parallel for schedule(dynamic, chunk_size) num_threads(NUM_THREADS)
+    for (int i = 0; i < A.rows; i++) {
+        double sum = 0.0;
+        for (int k = A.row_ptr[i]; k < A.row_ptr[i + 1]; k++) {
+            sum += A.val[k] * x[A.col_idx[k]];
+        }
+        y[i] = sum;
+    }
+}
+
+void spmv_guided(const SparseMatrix& A, const std::vector<double>& x,
+                 std::vector<double>& y) {
+    #pragma omp parallel for schedule(guided) num_threads(NUM_THREADS)
+    for (int i = 0; i < A.rows; i++) {
+        double sum = 0.0;
+        for (int k = A.row_ptr[i]; k < A.row_ptr[i + 1]; k++) {
+            sum += A.val[k] * x[A.col_idx[k]];
+        }
+        y[i] = sum;
+    }
+}
+
+void spmv_auto(const SparseMatrix& A, const std::vector<double>& x,
+               std::vector<double>& y) {
+    #pragma omp parallel for schedule(auto) num_threads(NUM_THREADS)
+    for (int i = 0; i < A.rows; i++) {
+        double sum = 0.0;
+        for (int k = A.row_ptr[i]; k < A.row_ptr[i + 1]; k++) {
+            sum += A.val[k] * x[A.col_idx[k]];
+        }
+        y[i] = sum;
+    }
+}
+
+bool validate_result(const SparseMatrix& A, const std::vector<double>& x,
+                     const std::vector<double>& y, double tolerance = 1e-10) {
+    std::cout << "[*] Validating results...\n";
+    
+    std::vector<double> y_ref(A.rows, 0.0);
+    
+    #pragma omp parallel for num_threads(1)
+    for (int i = 0; i < A.rows; i++) {
+        double sum = 0.0;
+        for (int k = A.row_ptr[i]; k < A.row_ptr[i + 1]; k++) {
+            sum += A.val[k] * x[A.col_idx[k]];
+        }
+        y_ref[i] = sum;
+    }
+    
+    int errors = 0;
+    #pragma omp parallel for reduction(+:errors)
+    for (int i = 0; i < A.rows; i++) {
+        double rel_error = std::abs(y[i] - y_ref[i]) / 
+                          (std::abs(y_ref[i]) + 1e-14);
+        if (rel_error > tolerance) {
+            errors++;
+            if (errors <= 5)
+                std::cerr << "Error at row " << i << ": computed=" 
+                         << y[i] << ", reference=" << y_ref[i] << "\n";
+        }
+    }
+    
+    if (errors == 0) {
+        std::cout << "    ✓ Validation PASSED\n";
+        return true;
+    } else {
+        std::cout << "    ✗ Validation FAILED (" << errors << " errors)\n";
+        return false;
+    }
+}
+
+BenchmarkResult benchmark_spmv(
+    const SparseMatrix& A,
+    const std::vector<double>& x,
+    std::vector<double>& y,
+    const char* strategy,
+    void (*spmv_func)(const SparseMatrix&, const std::vector<double>&,
+                      std::vector<double>&)
+) {
+    std::cout << "\n[*] Benchmarking: " << strategy << "\n";
+    
+    for (int i = 0; i < 3; i++) {
+        spmv_func(A, x, y);
+    }
+    
+    #pragma omp barrier
+    
+    std::vector<double> times;
+    for (int trial = 0; trial < NUM_TRIALS; trial++) {
+        double t_start = get_time();
+        spmv_func(A, x, y);
+        double t_end = get_time();
+        times.push_back(t_end - t_start);
+    }
+    
+    std::sort(times.begin(), times.end());
+    double min_time = times[0];
+    double max_time = times[NUM_TRIALS - 1];
+    double avg_time = 0.0;
+    for (double t : times) avg_time += t;
+    avg_time /= NUM_TRIALS;
+    
+    long long flops = 2LL * A.nnz;
+    long long bytes = (long long)A.nnz * (sizeof(int) + sizeof(double)) + 
+                      (long long)A.cols * sizeof(double);
+    
+    double gflops = (double)flops / (min_time * 1e9);
+    double bandwidth = (double)bytes / (min_time * 1e9);
+    
+    BenchmarkResult result;
+    result.time_sec = min_time;
+    result.gflops = gflops;
+    result.bandwidth_gb_s = bandwidth;
+    result.strategy = strategy;
+    
+    printf("    Time:       %.6f s (min), %.6f s (avg), %.6f s (max)\n",
+           min_time, avg_time, max_time);
+    printf("    Performance: %.2f GFlops\n", gflops);
+    printf("    Bandwidth:   %.2f GB/s\n", bandwidth);
+    printf("    Intensity:   %.4f flops/byte\n", 
+           (double)flops / bytes);
+    
+    return result;
+}
+
 
 int main() {
-    // ============================================================
-    // FASE 1: CONSTRUCCIÓN DEL GRAFO
-    // ============================================================
+    omp_set_num_threads(NUM_THREADS);
     
-    // Reservar memoria para el grafo (vector de vectores)
-    std::vector<std::vector<int>> graph(N);
+    double t_gen_start = get_time();
+    SparseMatrix A = generate_random_matrix(ROWS, COLS, AVG_NNZ_PER_ROW);
+    double t_gen_end = get_time();
     
-    // Generador de números aleatorios con semilla fija (reproducibilidad)
-    std::mt19937 gen(42);
-    std::uniform_int_distribution<> dis(0, N-1);
+    std::cout << "    Matrix generated in " << (t_gen_end - t_gen_start) 
+              << " seconds\n";
     
-    // Construir grafo aleatorio: cada nodo tiene AVG_DEGREE vecinos
-    std::cout << "Construyendo grafo..." << std::endl;
-    for(int i = 0; i < N; i++) {
-        graph[i].reserve(AVG_DEGREE);  // Pre-reservar espacio (eficiencia)
-        for(int j = 0; j < AVG_DEGREE; j++) {
-            graph[i].push_back(dis(gen));  // Agregar vecino aleatorio
-        }
+    std::vector<double> x(COLS), y(ROWS), y_backup(ROWS);
+    init_vector_numa_aware(x, NUM_THREADS);
+    init_vector_numa_aware(y, NUM_THREADS);
+    y_backup = y;
+    
+    y = y_backup;
+    spmv_static(A, x, y);
+    if (!validate_result(A, x, y)) {
+        std::cerr << "ERROR: Validation failed!\n";
+        return 1;
     }
     
+    std::vector<BenchmarkResult> results;
     
-    // ============================================================
-    // FASE 2: INICIALIZACIÓN DE ESTRUCTURAS BFS
-    // ============================================================
+    y = y_backup;
+    results.push_back(benchmark_spmv(A, x, y, "Static", spmv_static));
     
-    // Vector de distancias: -1 = no visitado, >=0 = nivel BFS
-    std::vector<int> distance(N, -1);
-    distance[0] = 0;  // El nodo 0 es la raíz (distancia 0)
+    y = y_backup;
+    results.push_back(benchmark_spmv(A, x, y, "Dynamic", spmv_dynamic));
     
-    // Vector atómico para marcar visitados sin race conditions
-    // std::atomic<bool> no funciona en vector, usamos vector de atomics manual
-    std::vector<std::atomic<bool>> visited(N);
-    for(int i = 0; i < N; i++) {
-        visited[i].store(false, std::memory_order_relaxed);  // Inicializar a false
-    }
-    visited[0].store(true, std::memory_order_relaxed);  // Marcar raíz como visitada
+    y = y_backup;
+    results.push_back(benchmark_spmv(A, x, y, "Guided", spmv_guided));
     
-    // Frontier actual (nodos en el nivel actual del BFS)
-    std::vector<int> frontier = {0};
+    y = y_backup;
+    results.push_back(benchmark_spmv(A, x, y, "Auto", spmv_auto));
     
     
-    // ============================================================
-    // FASE 3: CONFIGURACIÓN OPENMP
-    // ============================================================
+    std::cout << std::left << std::setw(12) << "Strategy"
+              << std::setw(15) << "Time (s)"
+              << std::setw(15) << "GFlops"
+              << std::setw(15) << "BW (GB/s)\n";
+    std::cout << std::string(57, '─') << "\n";
     
-    omp_set_num_threads(128);  // Establecer número de threads
-    
-    // Variables para estadísticas
-    int level = 0;
-    long long total_edges_explored = 0;
-    
-    std::cout << "Iniciando BFS con " << omp_get_max_threads() << " threads..." << std::endl;
-    double start = omp_get_wtime();  // Tiempo inicial
-    
-    
-    // ============================================================
-    // FASE 4: BFS PARALELO (BUCLE PRINCIPAL)
-    // ============================================================
-    
-    while(!frontier.empty()) {  // Mientras haya nodos por explorar
-        
-        // Vector para el siguiente nivel (next_frontier)
-        // Tamaño estimado: peor caso es frontier_size * AVG_DEGREE
-        std::vector<int> next_frontier;
-        next_frontier.reserve(frontier.size() * AVG_DEGREE / 10);
-        
-        // Contador atómico para saber dónde insertar en next_frontier
-        std::atomic<size_t> next_frontier_size(0);
-        
-        // Buffer temporal grande para evitar sincronización
-        // Cada thread escribe aquí sin locks
-        std::vector<int> temp_buffer(frontier.size() * AVG_DEGREE);
-        
-        
-        // --------------------------------------------------------
-        // REGIÓN PARALELA
-        // --------------------------------------------------------
-        #pragma omp parallel
-        {
-            // Cada thread tiene su propio vector local (sin sincronización)
-            std::vector<int> local_frontier;
-            local_frontier.reserve(1000);  // Capacidad inicial
-            
-            // --------------------------------------------------------
-            // PARALELIZAR EXPLORACIÓN DE FRONTIER
-            // schedule(dynamic, 64): distribución dinámica en chunks de 64
-            // Bueno para balance de carga cuando nodos tienen grados variables
-            // --------------------------------------------------------
-            #pragma omp for schedule(dynamic, 64) reduction(+:total_edges_explored)
-            for(size_t i = 0; i < frontier.size(); i++) {
-                int node = frontier[i];  // Nodo actual a explorar
-                
-                // Explorar todos los vecinos del nodo
-                for(int neighbor : graph[node]) {
-                    total_edges_explored++;  // Contar arista explorada
-                    
-                    // ------------------------------------------------
-                    // INTENTO ATÓMICO DE MARCAR COMO VISITADO
-                    // compare_exchange_strong: compara y cambia atómicamente
-                    // Si visited[neighbor] es false, lo cambia a true y retorna true
-                    // Si ya era true, retorna false (otro thread lo visitó primero)
-                    // ------------------------------------------------
-                    bool expected = false;
-                    if(visited[neighbor].compare_exchange_strong(
-                        expected,                        // Valor esperado (false)
-                        true,                           // Nuevo valor (true)
-                        std::memory_order_release,      // Memoria order para escritura
-                        std::memory_order_relaxed)) {   // Memoria order si falla
-                        
-                        // Solo este thread logró marcar el nodo
-                        distance[neighbor] = level + 1;  // Asignar distancia
-                        local_frontier.push_back(neighbor);  // Agregar a frontier local
-                    }
-                    // Si compare_exchange retornó false, otro thread ya procesó este nodo
-                }
-            }
-            
-            // --------------------------------------------------------
-            // FUSIÓN DE FRONTIERS LOCALES EN GLOBAL
-            // Sección crítica solo para fusionar vectores locales
-            // (mucho más eficiente que critical por cada nodo)
-            // --------------------------------------------------------
-            #pragma omp critical
-            {
-                next_frontier.insert(next_frontier.end(), 
-                                    local_frontier.begin(), 
-                                    local_frontier.end());
-            }
-        }
-        // FIN REGIÓN PARALELA
-        
-        
-        // --------------------------------------------------------
-        // ACTUALIZAR PARA SIGUIENTE ITERACIÓN
-        // --------------------------------------------------------
-        frontier = std::move(next_frontier);  // move: evita copiar, transfiere ownership
-        level++;  // Incrementar nivel BFS
-        
-        // Imprimir progreso cada 5 niveles
-        if(level % 5 == 0) {
-            std::cout << "Nivel " << level << ": " << frontier.size() 
-                      << " nodos en frontier" << std::endl;
-        }
+    for (const auto& r : results) {
+        std::cout << std::left << std::setw(12) << r.strategy
+                  << std::setw(15) << std::fixed << std::setprecision(6) << r.time_sec
+                  << std::setw(15) << std::fixed << std::setprecision(2) << r.gflops
+                  << std::setw(15) << std::fixed << std::setprecision(2) << r.bandwidth_gb_s
+                  << "\n";
     }
     
+    auto best = std::max_element(results.begin(), results.end(),
+        [](const BenchmarkResult& a, const BenchmarkResult& b) {
+            return a.gflops < b.gflops;
+        });
     
-    // ============================================================
-    // FASE 5: RESULTADOS Y ESTADÍSTICAS
-    // ============================================================
-    
-    double end = omp_get_wtime();
-    double elapsed = end - start;
-    
-    // Contar nodos alcanzados
-    long long nodes_reached = 0;
-    #pragma omp parallel for reduction(+:nodes_reached)
-    for(int i = 0; i < N; i++) {
-        if(distance[i] != -1) nodes_reached++;
-    }
-    
-    std::cout << "\n========== RESULTADOS ==========" << std::endl;
-    std::cout << "Tiempo total: " << elapsed << " segundos" << std::endl;
-    std::cout << "Niveles BFS: " << level << std::endl;
-    std::cout << "Nodos alcanzados: " << nodes_reached << " / " << N 
-              << " (" << (100.0*nodes_reached/N) << "%)" << std::endl;
-    std::cout << "Aristas exploradas: " << total_edges_explored << std::endl;
-    std::cout << "Throughput: " << (total_edges_explored/elapsed/1e6) 
-              << " M aristas/seg" << std::endl;
-    
-    // Calcular distribución de distancias
-    std::vector<int> distance_histogram(level + 1, 0);
-    for(int i = 0; i < N; i++) {
-        if(distance[i] != -1) {
-            distance_histogram[distance[i]]++;
-        }
-    }
-    
-    std::cout << "\nDistribución por nivel:" << std::endl;
-    for(int i = 0; i <= std::min(10, level); i++) {
-        std::cout << "  Nivel " << i << ": " << distance_histogram[i] << " nodos" << std::endl;
-    }
+    std::cout << "\n✓ Best strategy: " << best->strategy 
+              << " (" << best->gflops << " GFlops)\n";
     
     return 0;
 }
