@@ -9,11 +9,11 @@
 #include <cstring>
 #include <iomanip>
 
-constexpr int ROWS = 1000000;
-constexpr int COLS = 1000000;
+constexpr int ROWS = 5000000;
+constexpr int COLS = 5000000;
 constexpr int AVG_NNZ_PER_ROW = 32;
 constexpr int NUM_TRIALS = 10;
-constexpr int NUM_THREADS = 16;
+constexpr int NUM_THREADS = 12;
 
 
 double get_time() {
@@ -34,10 +34,10 @@ SparseMatrix generate_random_matrix(int rows, int cols, int avg_nnz) {
     SparseMatrix A;
     A.rows = rows;
     A.cols = cols;
-    
+
     std::mt19937 gen(42);
     std::poisson_distribution<> poisson(avg_nnz);
-    
+
     std::cout << "[*] Calculating row structure...\n";
     A.row_ptr.resize(rows + 1, 0);
     for (int i = 0; i < rows; i++) {
@@ -45,42 +45,42 @@ SparseMatrix generate_random_matrix(int rows, int cols, int avg_nnz) {
         A.row_ptr[i + 1] = A.row_ptr[i] + nnz_in_row;
     }
     A.nnz = A.row_ptr[rows];
-    
-    std::cout << "[*] Total NNZ: " << A.nnz << " (density: " 
+
+    std::cout << "[*] Total NNZ: " << A.nnz << " (density: "
               << (100.0 * A.nnz / (long long)rows / cols) << "%)\n";
-    
+
     std::cout << "[*] Generating matrix data...\n";
     A.col_idx.resize(A.nnz);
     A.val.resize(A.nnz);
-    
+
     #pragma omp parallel for schedule(static) num_threads(NUM_THREADS)
     for (int i = 0; i < rows; i++) {
         std::mt19937 local_gen(42 + omp_get_thread_num() * 1000 + i);
         std::uniform_int_distribution<> local_col_dist(0, cols - 1);
         std::uniform_real_distribution<> local_val_dist(0.0, 1.0);
-        
+
         int start = A.row_ptr[i];
         int end = A.row_ptr[i + 1];
-        
+
         for (int k = start; k < end; k++) {
             A.col_idx[k] = local_col_dist(local_gen);
             A.val[k] = local_val_dist(local_gen);
         }
     }
-    
+
     return A;
 }
 
 void init_vector_numa_aware(std::vector<double>& v, int num_threads) {
     std::cout << "[*] Initializing vector with random values (NUMA-aware first-touch)...\n";
-    
+
     const int n = v.size();
-    
+
     #pragma omp parallel for schedule(static) num_threads(num_threads)
     for (int i = 0; i < n; i++) {
         std::mt19937 local_gen(42 + omp_get_thread_num());
         std::uniform_real_distribution<> local_val_dist(0.0, 1.0);
-        
+
 
         if (i % (n / num_threads + 1) == 0) {
              local_gen.seed(42 + omp_get_thread_num() * 1000 + i);
@@ -110,8 +110,8 @@ void spmv_static(const SparseMatrix& A, const std::vector<double>& x,
 }
 
 void spmv_dynamic(const SparseMatrix& A, const std::vector<double>& x,
-                  std::vector<double>& y, int chunk_size = 256) {
-    #pragma omp parallel for schedule(dynamic, chunk_size) num_threads(NUM_THREADS)
+                  std::vector<double>& y) {
+    #pragma omp parallel for schedule(dynamic, 256) num_threads(NUM_THREADS)
     for (int i = 0; i < A.rows; i++) {
         double sum = 0.0;
         for (int k = A.row_ptr[i]; k < A.row_ptr[i + 1]; k++) {
@@ -148,9 +148,9 @@ void spmv_auto(const SparseMatrix& A, const std::vector<double>& x,
 bool validate_result(const SparseMatrix& A, const std::vector<double>& x,
                      const std::vector<double>& y, double tolerance = 1e-10) {
     std::cout << "[*] Validating results...\n";
-    
+
     std::vector<double> y_ref(A.rows, 0.0);
-    
+
     #pragma omp parallel for num_threads(1)
     for (int i = 0; i < A.rows; i++) {
         double sum = 0.0;
@@ -159,20 +159,20 @@ bool validate_result(const SparseMatrix& A, const std::vector<double>& x,
         }
         y_ref[i] = sum;
     }
-    
+
     int errors = 0;
     #pragma omp parallel for reduction(+:errors)
     for (int i = 0; i < A.rows; i++) {
-        double rel_error = std::abs(y[i] - y_ref[i]) / 
+        double rel_error = std::abs(y[i] - y_ref[i]) /
                           (std::abs(y_ref[i]) + 1e-14);
         if (rel_error > tolerance) {
             errors++;
             if (errors <= 5)
-                std::cerr << "Error at row " << i << ": computed=" 
+                std::cerr << "Error at row " << i << ": computed="
                          << y[i] << ", reference=" << y_ref[i] << "\n";
         }
     }
-    
+
     if (errors == 0) {
         std::cout << "    ✓ Validation PASSED\n";
         return true;
@@ -191,13 +191,13 @@ BenchmarkResult benchmark_spmv(
                       std::vector<double>&)
 ) {
     std::cout << "\n[*] Benchmarking: " << strategy << "\n";
-    
+
     for (int i = 0; i < 3; i++) {
         spmv_func(A, x, y);
     }
-    
+
     #pragma omp barrier
-    
+
     std::vector<double> times;
     for (int trial = 0; trial < NUM_TRIALS; trial++) {
         double t_start = get_time();
@@ -205,81 +205,81 @@ BenchmarkResult benchmark_spmv(
         double t_end = get_time();
         times.push_back(t_end - t_start);
     }
-    
+
     std::sort(times.begin(), times.end());
     double min_time = times[0];
     double max_time = times[NUM_TRIALS - 1];
     double avg_time = 0.0;
     for (double t : times) avg_time += t;
     avg_time /= NUM_TRIALS;
-    
+
     long long flops = 2LL * A.nnz;
-    long long bytes = (long long)A.nnz * (sizeof(int) + sizeof(double)) + 
+    long long bytes = (long long)A.nnz * (sizeof(int) + sizeof(double)) +
                       (long long)A.cols * sizeof(double);
-    
+
     double gflops = (double)flops / (min_time * 1e9);
     double bandwidth = (double)bytes / (min_time * 1e9);
-    
+
     BenchmarkResult result;
     result.time_sec = min_time;
     result.gflops = gflops;
     result.bandwidth_gb_s = bandwidth;
     result.strategy = strategy;
-    
+
     printf("    Time:       %.6f s (min), %.6f s (avg), %.6f s (max)\n",
            min_time, avg_time, max_time);
     printf("    Performance: %.2f GFlops\n", gflops);
     printf("    Bandwidth:   %.2f GB/s\n", bandwidth);
-    printf("    Intensity:   %.4f flops/byte\n", 
+    printf("    Intensity:   %.4f flops/byte\n",
            (double)flops / bytes);
-    
+
     return result;
 }
 
 
 int main() {
     omp_set_num_threads(NUM_THREADS);
-    
+
     double t_gen_start = get_time();
     SparseMatrix A = generate_random_matrix(ROWS, COLS, AVG_NNZ_PER_ROW);
     double t_gen_end = get_time();
-    
-    std::cout << "    Matrix generated in " << (t_gen_end - t_gen_start) 
+
+    std::cout << "    Matrix generated in " << (t_gen_end - t_gen_start)
               << " seconds\n";
-    
+
     std::vector<double> x(COLS), y(ROWS), y_backup(ROWS);
     init_vector_numa_aware(x, NUM_THREADS);
     init_vector_numa_aware(y, NUM_THREADS);
     y_backup = y;
-    
+
     y = y_backup;
     spmv_static(A, x, y);
     if (!validate_result(A, x, y)) {
         std::cerr << "ERROR: Validation failed!\n";
         return 1;
     }
-    
+
     std::vector<BenchmarkResult> results;
-    
+
     y = y_backup;
     results.push_back(benchmark_spmv(A, x, y, "Static", spmv_static));
-    
+
     y = y_backup;
     results.push_back(benchmark_spmv(A, x, y, "Dynamic", spmv_dynamic));
-    
+
     y = y_backup;
     results.push_back(benchmark_spmv(A, x, y, "Guided", spmv_guided));
-    
+
     y = y_backup;
     results.push_back(benchmark_spmv(A, x, y, "Auto", spmv_auto));
-    
-    
+
+
     std::cout << std::left << std::setw(12) << "Strategy"
               << std::setw(15) << "Time (s)"
               << std::setw(15) << "GFlops"
               << std::setw(15) << "BW (GB/s)\n";
-    std::cout << std::string(57, '─') << "\n";
-    
+    std::cout << std::string(57, '/') << "\n";
+
     for (const auto& r : results) {
         std::cout << std::left << std::setw(12) << r.strategy
                   << std::setw(15) << std::fixed << std::setprecision(6) << r.time_sec
@@ -287,14 +287,14 @@ int main() {
                   << std::setw(15) << std::fixed << std::setprecision(2) << r.bandwidth_gb_s
                   << "\n";
     }
-    
+
     auto best = std::max_element(results.begin(), results.end(),
         [](const BenchmarkResult& a, const BenchmarkResult& b) {
             return a.gflops < b.gflops;
         });
-    
-    std::cout << "\n✓ Best strategy: " << best->strategy 
+
+    std::cout << "\n✓ Best strategy: " << best->strategy
               << " (" << best->gflops << " GFlops)\n";
-    
+
     return 0;
 }
